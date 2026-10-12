@@ -349,30 +349,6 @@ function _p9k_human_readable_bytes() {
   _p9k__ret=${${_p9k__ret%%0#}%.}$suf
 }
 
-if [[ $ZSH_VERSION == (5.<4->*|<6->.*) ]]; then
-  function _p9k_print_params() { typeset -p -- "$@" }
-else
-  # Cannot use `typeset -p` unconditionally because of bugs in zsh.
-  function _p9k_print_params() {
-    local name
-    for name; do
-      case $parameters[$name] in
-        array*)
-          print -r -- "$name=(" "${(@q)${(@P)name}}" ")"
-        ;;
-        association*)
-          # Cannot use "${(@q)${(@kvP)name}}" because of bugs in zsh.
-          local kv=("${(@kvP)name}")
-          print -r -- "$name=(" "${(@q)kv}" ")"
-        ;;
-        *)
-          print -r -- "$name=${(q)${(P)name}}"
-        ;;
-      esac
-    done
-  }
-fi
-
 # Determine if the passed segment is used in the prompt
 #
 # Pass the name of the segment to this function to test for its presence in
@@ -1270,18 +1246,13 @@ _p9k_prompt_disk_usage_init() {
   typeset -g _p9k__disk_usage_normal=
   typeset -g _p9k__disk_usage_warning=
   typeset -g _p9k__disk_usage_critical=
-  _p9k__async_segments_compute+='_p9k_worker_invoke disk_usage "_p9k_prompt_disk_usage_compute ${(q)_p9k__cwd_a}"'
+  _p9k__async_segments_compute+='_p9k_worker_invoke disk_usage _p9k_prompt_disk_usage_sync disk_usage $_p9k__cwd_a'
 }
 
-_p9k_prompt_disk_usage_compute() {
-  (( $+commands[df] )) || return
-  _p9k_worker_async "_p9k_prompt_disk_usage_async ${(q)1}" _p9k_prompt_disk_usage_sync
-}
-
-_p9k_prompt_disk_usage_async() {
-  local pct=${${=${(f)"$(df -P $1 2>/dev/null)"}[2]}[5]%%%}
-  [[ $pct == <0-100> && $pct != $_p9k__disk_usage_pct ]] || return
-  _p9k__disk_usage_pct=$pct
+# $1: percentage of the filesystem in use, empty when the directory is gone
+_p9k_prompt_disk_usage_sync() {
+  [[ $1 == <0-100> && $1 != $_p9k__disk_usage_pct ]] || return
+  _p9k__disk_usage_pct=$1
   _p9k__disk_usage_normal=
   _p9k__disk_usage_warning=
   _p9k__disk_usage_critical=
@@ -1292,17 +1263,7 @@ _p9k_prompt_disk_usage_async() {
   elif (( ! _POWERLEVEL9K_DISK_USAGE_ONLY_WARNING )); then
     _p9k__disk_usage_normal=1
   fi
-  _p9k_print_params          \
-    _p9k__disk_usage_pct     \
-    _p9k__disk_usage_normal  \
-    _p9k__disk_usage_warning \
-    _p9k__disk_usage_critical
-  echo -E - 'reset=1'
-}
-
-_p9k_prompt_disk_usage_sync() {
-  eval $REPLY
-  _p9k_worker_reply $REPLY
+  reset=1
 }
 
 function _p9k_read_file() {
@@ -1342,14 +1303,17 @@ _p9k_prompt_fvm_init() {
 ################################################################
 # Segment that displays the battery status in levels and colors
 prompt_battery() {
-  [[ $_p9k_os == (Linux|Android) ]] && _p9k_prompt_battery_set_args
+  if [[ $_p9k_os == (Linux|Android) ]]; then
+    local -a facts
+    _p9k_prompt_battery_linux_facts && _p9k_prompt_battery_set_args "${(@)facts}" || _p9k__battery_args=()
+  fi
   (( $#_p9k__battery_args )) && _p9k_prompt_segment "${_p9k__battery_args[@]}"
 }
 
 _p9k_prompt_battery_init() {
   typeset -ga _p9k__battery_args=()
-  if [[ $_p9k_os == OSX && $+commands[pmset] == 1 ]]; then
-    _p9k__async_segments_compute+='_p9k_worker_invoke battery _p9k_prompt_battery_compute'
+  if [[ $_p9k_os == OSX ]]; then
+    _p9k__async_segments_compute+='_p9k_worker_invoke battery _p9k_prompt_battery_sync battery'
     return
   fi
   if [[ $_p9k_os != (Linux|Android) ||
@@ -1358,114 +1322,92 @@ _p9k_prompt_battery_init() {
   fi
 }
 
-_p9k_prompt_battery_compute() {
-  _p9k_worker_async _p9k_prompt_battery_async _p9k_prompt_battery_sync
-}
-
-_p9k_prompt_battery_async() {
-  local prev="${(pj:\0:)_p9k__battery_args}"
-  _p9k_prompt_battery_set_args
-  [[ "${(pj:\0:)_p9k__battery_args}" == $prev ]] && return 1
-  _p9k_print_params _p9k__battery_args
-  echo -E - 'reset=2'
-}
-
+# $1: percent, $2: charging|discharging|full, $3: remaining time (H:MM, ... or empty);
+# all empty when there is no battery
 _p9k_prompt_battery_sync() {
-  eval $REPLY
-  _p9k_worker_reply $REPLY
+  local prev="${(pj:\0:)_p9k__battery_args}"
+  if [[ -n $1 ]]; then
+    _p9k_prompt_battery_set_args "$@" || _p9k__battery_args=()
+  else
+    _p9k__battery_args=()
+  fi
+  [[ "${(pj:\0:)_p9k__battery_args}" == $prev ]] || reset=2
 }
 
+# Sets `facts` to the same three values p10kd reports on macOS, read from sysfs.
+# See https://sourceforge.net/projects/acpiclient.
+_p9k_prompt_battery_linux_facts() {
+  local -a bats=( /sys/class/power_supply/(CMB*|BAT*|*battery)/(FN) )
+  (( $#bats )) || return
+
+  local -i energy_now energy_full power_now
+  local -i is_full=1 is_calculating is_charching
+  local dir
+  for dir in $bats; do
+    _p9k_read_file $dir/status(N) && local bat_status=$_p9k__ret || continue
+    # Skip batteries with "Unknown" status: https://github.com/romkatv/powerlevel10k/pull/2562.
+    [[ $bat_status == Unknown ]] && continue
+    local -i pow=0 full=0
+    if _p9k_read_file $dir/(energy_full|charge_full|charge_counter)(N); then
+      (( energy_full += ${full::=_p9k__ret} ))
+    fi
+    if _p9k_read_file $dir/(power|current)_now(N) && (( $#_p9k__ret < 9 )); then
+      (( power_now += ${pow::=$_p9k__ret} ))
+    fi
+    if _p9k_read_file $dir/capacity(N); then
+      (( energy_now += _p9k__ret * full / 100. + 0.5 ))
+    elif _p9k_read_file $dir/(energy|charge)_now(N); then
+      (( energy_now += _p9k__ret ))
+    fi
+    [[ $bat_status != Full                                ]] && is_full=0
+    [[ $bat_status == Charging                            ]] && is_charching=1
+    [[ $bat_status == (Charging|Discharging) && $pow == 0 ]] && is_calculating=1
+  done
+
+  (( energy_full )) || return
+
+  local -i bat_percent=$(( 100. * energy_now / energy_full + 0.5 ))
+  (( bat_percent > 100 )) && bat_percent=100
+
+  local status remain
+  if (( is_full )); then
+    status=full
+  elif (( is_charching )); then
+    status=charging
+  else
+    status=discharging
+  fi
+  if (( power_now > 0 )); then
+    (( is_charching )) && local -i e=$((energy_full - energy_now)) || local -i e=energy_now
+    local -i minutes=$(( 60 * e / power_now ))
+    (( minutes > 0 )) && remain=$((minutes/60)):${(l#2##0#)$((minutes%60))}
+  elif (( is_calculating )); then
+    remain="..."
+  fi
+  facts=($bat_percent $status "$remain")
+}
+
+# $1: percent, $2: charging|discharging|full, $3: remaining time
 _p9k_prompt_battery_set_args() {
   _p9k__battery_args=()
 
-  local state remain
-  local -i bat_percent
-
-  case $_p9k_os in
-    OSX)
-      (( $+commands[pmset] )) || return
-      local raw_data=${${(Af)"$(pmset -g batt 2>/dev/null)"}[2]}
-      [[ $raw_data == *InternalBattery* ]] || return
-      remain=${${(s: :)${${(s:; :)raw_data}[3]}}[1]}
-      [[ $remain == *no* ]] && remain="..."
-      [[ $raw_data =~ '([0-9]+)%' ]] && bat_percent=$match[1]
-
-      case "${${(s:; :)raw_data}[2]}" in
-        'charging'|'finishing charge'|'AC attached')
-          if (( bat_percent == 100 )); then
-            state=CHARGED
-            remain=''
-          else
-            state=CHARGING
-          fi
-        ;;
-        'discharging')
-          (( bat_percent < _POWERLEVEL9K_BATTERY_LOW_THRESHOLD )) && state=LOW || state=DISCONNECTED
-        ;;
-        *)
-          state=CHARGED
-          remain=''
-        ;;
-      esac
-    ;;
-
-    Linux|Android)
-      # See https://sourceforge.net/projects/acpiclient.
-      local -a bats=( /sys/class/power_supply/(CMB*|BAT*|*battery)/(FN) )
-      (( $#bats )) || return
-
-      local -i energy_now energy_full power_now
-      local -i is_full=1 is_calculating is_charching
-      local dir
-      for dir in $bats; do
-        _p9k_read_file $dir/status(N) && local bat_status=$_p9k__ret || continue
-        # Skip batteries with "Unknown" status: https://github.com/romkatv/powerlevel10k/pull/2562.
-        [[ $bat_status == Unknown ]] && continue
-        local -i pow=0 full=0
-        if _p9k_read_file $dir/(energy_full|charge_full|charge_counter)(N); then
-          (( energy_full += ${full::=_p9k__ret} ))
-        fi
-        if _p9k_read_file $dir/(power|current)_now(N) && (( $#_p9k__ret < 9 )); then
-          (( power_now += ${pow::=$_p9k__ret} ))
-        fi
-        if _p9k_read_file $dir/capacity(N); then
-          (( energy_now += _p9k__ret * full / 100. + 0.5 ))
-        elif _p9k_read_file $dir/(energy|charge)_now(N); then
-          (( energy_now += _p9k__ret ))
-        fi
-        [[ $bat_status != Full                                ]] && is_full=0
-        [[ $bat_status == Charging                            ]] && is_charching=1
-        [[ $bat_status == (Charging|Discharging) && $pow == 0 ]] && is_calculating=1
-      done
-
-      (( energy_full )) || return
-
-      bat_percent=$(( 100. * energy_now / energy_full + 0.5 ))
-      (( bat_percent > 100 )) && bat_percent=100
-
-      if (( is_full || (bat_percent == 100 && is_charching) )); then
+  local -i bat_percent=$1
+  local state remain=$3
+  case $2 in
+    charging)
+      if (( bat_percent == 100 )); then
         state=CHARGED
+        remain=''
       else
-        if (( is_charching )); then
-          state=CHARGING
-        elif (( bat_percent < _POWERLEVEL9K_BATTERY_LOW_THRESHOLD )); then
-          state=LOW
-        else
-          state=DISCONNECTED
-        fi
-
-        if (( power_now > 0 )); then
-          (( is_charching )) && local -i e=$((energy_full - energy_now)) || local -i e=energy_now
-          local -i minutes=$(( 60 * e / power_now ))
-          (( minutes > 0 )) && remain=$((minutes/60)):${(l#2##0#)$((minutes%60))}
-        elif (( is_calculating )); then
-          remain="..."
-        fi
+        state=CHARGING
       fi
     ;;
-
+    discharging)
+      (( bat_percent < _POWERLEVEL9K_BATTERY_LOW_THRESHOLD )) && state=LOW || state=DISCONNECTED
+    ;;
     *)
-      return 0
+      state=CHARGED
+      remain=''
     ;;
   esac
 
@@ -1518,58 +1460,29 @@ prompt_public_ip() {
 _p9k_prompt_public_ip_init() {
   typeset -g _p9k__public_ip=
   typeset -gF _p9k__public_ip_next_time=0
-  _p9k__async_segments_compute+='_p9k_worker_invoke public_ip _p9k_prompt_public_ip_compute'
+  # Empty while idle; the time the current fetch was requested while one is in flight.
+  typeset -g _p9k__public_ip_fetch_start=
+  _p9k__async_segments_compute+='_p9k_prompt_public_ip_compute'
 }
 
 _p9k_prompt_public_ip_compute() {
-  (( EPOCHREALTIME >= _p9k__public_ip_next_time )) || return
-  _p9k_worker_async _p9k_prompt_public_ip_async _p9k_prompt_public_ip_sync
+  [[ -z $_p9k__public_ip_fetch_start ]] && (( EPOCHREALTIME >= _p9k__public_ip_next_time )) || return
+  _p9k__public_ip_fetch_start=$EPOCHREALTIME
+  _p9k_worker_invoke public_ip _p9k_prompt_public_ip_sync public_ip \
+    "$_POWERLEVEL9K_PUBLIC_IP_HOST" $_POWERLEVEL9K_PUBLIC_IP_METHODS
 }
 
-_p9k_prompt_public_ip_async() {
-  local ip method
-  local -F start=EPOCHREALTIME
-  local -F next='start + 5'
-  for method in $_POWERLEVEL9K_PUBLIC_IP_METHODS $_POWERLEVEL9K_PUBLIC_IP_METHODS; do
-    case $method in
-      dig)
-        if (( $+commands[dig] )); then
-          ip="$(dig +tries=1 +short -4 A myip.opendns.com @resolver1.opendns.com 2>/dev/null)"
-          [[ $ip == ';'* ]] && ip=
-          if [[ -z $ip ]]; then
-            ip="$(dig +tries=1 +short -6 AAAA myip.opendns.com @resolver1.opendns.com 2>/dev/null)"
-            [[ $ip == ';'* ]] && ip=
-          fi
-        fi
-      ;;
-      curl)
-        if (( $+commands[curl] )); then
-          ip="$(curl --max-time 5 -w '\n' "$_POWERLEVEL9K_PUBLIC_IP_HOST" 2>/dev/null)"
-        fi
-      ;;
-      wget)
-        if (( $+commands[wget] )); then
-          ip="$(wget -T 5 -qO- "$_POWERLEVEL9K_PUBLIC_IP_HOST" 2>/dev/null)"
-        fi
-      ;;
-    esac
-    [[ $ip =~ '^[0-9a-f.:]+$' ]] || ip=''
-    if [[ -n $ip ]]; then
-      next=$((start + _POWERLEVEL9K_PUBLIC_IP_TIMEOUT))
-      break
-    fi
-  done
-  _p9k__public_ip_next_time=$next
-  _p9k_print_params _p9k__public_ip_next_time
-  [[ $_p9k__public_ip == $ip ]] && return
-  _p9k__public_ip=$ip
-  _p9k_print_params _p9k__public_ip
-  echo -E - 'reset=1'
-}
-
+# $1: the public IP, empty when no method could find it
 _p9k_prompt_public_ip_sync() {
-  eval $REPLY
-  _p9k_worker_reply $REPLY
+  if [[ -n $1 ]]; then
+    _p9k__public_ip_next_time=$((_p9k__public_ip_fetch_start + _POWERLEVEL9K_PUBLIC_IP_TIMEOUT))
+  else
+    _p9k__public_ip_next_time=$((_p9k__public_ip_fetch_start + 5))
+  fi
+  _p9k__public_ip_fetch_start=
+  [[ $_p9k__public_ip == $1 ]] && return
+  _p9k__public_ip=$1
+  reset=1
 }
 
 ################################################################
@@ -2372,20 +2285,15 @@ _p9k_prompt_load_init() {
     typeset -g _p9k__load_normal=
     typeset -g _p9k__load_warning=
     typeset -g _p9k__load_critical=
-    _p9k__async_segments_compute+='_p9k_worker_invoke load _p9k_prompt_load_compute'
+    _p9k__async_segments_compute+='_p9k_worker_invoke load _p9k_prompt_load_sync load'
   elif [[ ! -r /proc/loadavg ]]; then
     typeset -g "_p9k__segment_cond_${_p9k__prompt_side}[_p9k__segment_index]"='${:-}'
   fi
 }
 
-_p9k_prompt_load_compute() {
-  (( $+commands[sysctl] )) || return
-  _p9k_worker_async _p9k_prompt_load_async _p9k_prompt_load_sync
-}
-
-_p9k_prompt_load_async() {
-  local load="$(sysctl -n vm.loadavg 2>/dev/null)" || return
-  load=${${(A)=load}[_POWERLEVEL9K_LOAD_WHICH+1]//,/.}
+# $1, $2, $3: load averages over 1, 5 and 15 minutes
+_p9k_prompt_load_sync() {
+  local load=$argv[_POWERLEVEL9K_LOAD_WHICH]
   [[ $load == <->(|.<->) && $load != $_p9k__load_value ]] || return
   _p9k__load_value=$load
   _p9k__load_normal=
@@ -2399,17 +2307,7 @@ _p9k_prompt_load_async() {
   else
     _p9k__load_normal=1
   fi
-  _p9k_print_params     \
-    _p9k__load_value    \
-    _p9k__load_normal   \
-    _p9k__load_warning  \
-    _p9k__load_critical
-  echo -E - 'reset=1'
-}
-
-_p9k_prompt_load_sync() {
-  eval $REPLY
-  _p9k_worker_reply $REPLY
+  reset=1
 }
 
 # Usage: _p9k_cached_cmd <0|1> <dep> <cmd> [args...]
@@ -2733,61 +2631,20 @@ prompt_ram() {
 }
 
 function _p9k_prompt_ram_init() {
-  if [[ $_p9k_os == OSX && $+commands[vm_stat] == 0 ||
-        $_p9k_os == BSD && ! -r /var/run/dmesg.boot ||
-        $_p9k_os != (OSX|BSD) && ! -r /proc/meminfo ]]; then
+  if [[ $_p9k_os != OSX && ! -r /proc/meminfo ]]; then
     typeset -g "_p9k__segment_cond_${_p9k__prompt_side}[_p9k__segment_index]"='${:-}'
     return
   fi
   typeset -g _p9k__ram_free=
-  _p9k__async_segments_compute+='_p9k_worker_invoke ram _p9k_prompt_ram_compute'
+  _p9k__async_segments_compute+='_p9k_worker_invoke ram _p9k_prompt_ram_sync ram'
 }
 
-_p9k_prompt_ram_compute() {
-  _p9k_worker_async _p9k_prompt_ram_async _p9k_prompt_ram_sync
-}
-
-_p9k_prompt_ram_async() {
-  local -F free_bytes
-
-  case $_p9k_os in
-    OSX)
-      (( $+commands[vm_stat] )) || return
-      local stat && stat="$(vm_stat 2>/dev/null)" || return
-      [[ $stat =~ 'Pages free:[[:space:]]+([0-9]+)' ]] || return
-      (( free_bytes += match[1] ))
-      [[ $stat =~ 'Pages inactive:[[:space:]]+([0-9]+)' ]] || return
-      (( free_bytes += match[1] ))
-      if (( ! $+_p9k__ram_pagesize )); then
-        local p
-        (( $+commands[pagesize] )) && p=$(pagesize 2>/dev/null) && [[ $p == <1-> ]] || p=4096
-        typeset -gi _p9k__ram_pagesize=p
-        _p9k_print_params _p9k__ram_pagesize
-      fi
-      (( free_bytes *= _p9k__ram_pagesize ))
-    ;;
-    BSD)
-      local stat && stat="$(grep -F 'avail memory' /var/run/dmesg.boot 2>/dev/null)" || return
-      free_bytes=${${(A)=stat}[4]}
-    ;;
-    *)
-      [[ -r /proc/meminfo ]] || return
-      local stat && stat="$(</proc/meminfo)" || return
-      [[ $stat == (#b)*(MemAvailable:|MemFree:)[[:space:]]#(<->)* ]] || return
-      free_bytes=$(( $match[2] * 1024 ))
-    ;;
-  esac
-
-  _p9k_human_readable_bytes $free_bytes
+# $1: free bytes
+_p9k_prompt_ram_sync() {
+  _p9k_human_readable_bytes $1
   [[ $_p9k__ret != $_p9k__ram_free ]] || return
   _p9k__ram_free=$_p9k__ret
-  _p9k_print_params _p9k__ram_free
-  echo -E - 'reset=1'
-}
-
-_p9k_prompt_ram_sync() {
-  eval $REPLY
-  _p9k_worker_reply $REPLY
+  reset=1
 }
 
 function _p9k_rbenv_global_version() {
@@ -3217,38 +3074,14 @@ _p9k_rust_version_prefetch() {
     unset P9K_RUST_VERSION
     return
   fi
-  _p9k_worker_invoke rust_version \
-    "_p9k_prompt_rust_version_compute ${(q)P9K_RUST_VERSION} ${(q)rustc} ${(q)_p9k__cwd_a}"
+  _p9k_worker_invoke rust_version _p9k_prompt_rust_version_sync rust_version $rustc $_p9k__cwd_a
 }
 
-_p9k_prompt_rust_version_compute() {
-  _p9k_worker_async                                          \
-    "_p9k_prompt_rust_version_async ${(q)1} ${(q)2} ${(q)3}" \
-    _p9k_prompt_rust_version_sync
-}
-
-_p9k_prompt_rust_version_async() {
-  typeset -g P9K_RUST_VERSION=$1
-  local rustc=$2 cwd=$3 v
-  if pushd -q -- $cwd; then
-    {
-      v=${${"$($rustc --version)"#rustc }%% *} || v=
-    } always {
-      popd -q
-    }
-  fi
-
-  [[ $v != $P9K_RUST_VERSION ]] || return
-  typeset -g P9K_RUST_VERSION=$v
-  _p9k_print_params P9K_RUST_VERSION
-  echo -E - 'reset=1'
-}
-
+# $1: the rustc version for the directory the request was made in, empty when rustc failed
 _p9k_prompt_rust_version_sync() {
-  if [[ -n $REPLY ]]; then
-    eval $REPLY
-    _p9k_worker_reply $REPLY
-  fi
+  [[ $1 != $P9K_RUST_VERSION ]] || return
+  typeset -g P9K_RUST_VERSION=$1
+  reset=1
 }
 
 # RSpec test ratio
@@ -3409,53 +3242,20 @@ prompt_swap() {
 }
 
 function _p9k_prompt_swap_init() {
-  if [[ $_p9k_os == OSX && $+commands[sysctl] == 0 || $_p9k_os != OSX && ! -r /proc/meminfo ]]; then
+  if [[ $_p9k_os != OSX && ! -r /proc/meminfo ]]; then
     typeset -g "_p9k__segment_cond_${_p9k__prompt_side}[_p9k__segment_index]"='${:-}'
     return
   fi
   typeset -g _p9k__swap_used=
-  _p9k__async_segments_compute+='_p9k_worker_invoke swap _p9k_prompt_swap_compute'
+  _p9k__async_segments_compute+='_p9k_worker_invoke swap _p9k_prompt_swap_sync swap'
 }
 
-_p9k_prompt_swap_compute() {
-  _p9k_worker_async _p9k_prompt_swap_async _p9k_prompt_swap_sync
-}
-
-_p9k_prompt_swap_async() {
-  local -F used_bytes
-
-  if [[ "$_p9k_os" == "OSX" ]]; then
-    (( $+commands[sysctl] )) || return
-    [[ "$(sysctl vm.swapusage 2>/dev/null)" =~ "used = ([0-9,.]+)([A-Z]+)" ]] || return
-    used_bytes=${match[1]//,/.}
-    case ${match[2]} in
-      'K') (( used_bytes *= 1024 ));;
-      'M') (( used_bytes *= 1048576 ));;
-      'G') (( used_bytes *= 1073741824 ));;
-      'T') (( used_bytes *= 1099511627776 ));;
-      *) return 0;;
-    esac
-  else
-    local meminfo && meminfo="$(grep -F 'Swap' /proc/meminfo 2>/dev/null)" || return
-    [[ $meminfo =~ 'SwapTotal:[[:space:]]+([0-9]+)' ]] || return
-    (( used_bytes+=match[1] ))
-    [[ $meminfo =~ 'SwapFree:[[:space:]]+([0-9]+)' ]] || return
-    (( used_bytes-=match[1] ))
-    (( used_bytes *= 1024 ))
-  fi
-
-  (( used_bytes >= 0 || (used_bytes = 0) ))
-
-  _p9k_human_readable_bytes $used_bytes
+# $1: used bytes
+_p9k_prompt_swap_sync() {
+  _p9k_human_readable_bytes $1
   [[ $_p9k__ret != $_p9k__swap_used ]] || return
   _p9k__swap_used=$_p9k__ret
-  _p9k_print_params _p9k__swap_used
-  echo -E - 'reset=1'
-}
-
-_p9k_prompt_swap_sync() {
-  eval $REPLY
-  _p9k_worker_reply $REPLY
+  reset=1
 }
 
 ################################################################
@@ -3527,21 +3327,17 @@ instant_prompt_time() {
 
 _p9k_prompt_time_init() {
   (( _POWERLEVEL9K_EXPERIMENTAL_TIME_REALTIME )) || return
-  _p9k__async_segments_compute+='_p9k_worker_invoke time _p9k_prompt_time_compute'
+  _p9k__async_segments_compute+='_p9k_prompt_time_compute'
 }
 
+# The daemon answers when the clock next crosses a multiple of the interval.
 _p9k_prompt_time_compute() {
-  _p9k_worker_async _p9k_prompt_time_async _p9k_prompt_time_sync
-}
-
-_p9k_prompt_time_async() {
-  zmodload zsh/mathfunc zsh/zselect || return
-  local -F t=_POWERLEVEL9K_EXPERIMENTAL_TIME_REALTIME_INTERVAL_SEC
-  zselect -t $((int(ceil(100 * (t - EPOCHREALTIME % t))))) || true
+  _p9k_worker_invoke time _p9k_prompt_time_sync time $_POWERLEVEL9K_EXPERIMENTAL_TIME_REALTIME_INTERVAL_SEC
 }
 
 _p9k_prompt_time_sync() {
-  _p9k_worker_reply '_p9k_worker_invoke _p9k_prompt_time_compute _p9k_prompt_time_compute; reset=1'
+  _p9k_prompt_time_compute
+  reset=1
 }
 
 ################################################################
@@ -4754,7 +4550,11 @@ _p9k_gcloud_prefetch() {
   fi
   [[ -n $P9K_GCLOUD_CONFIGURATION && -n $P9K_GCLOUD_ACCOUNT && -n $P9K_GCLOUD_PROJECT_ID ]] || return
   _p9k__gcloud_last_fetch_ts=EPOCHREALTIME
-  _p9k_worker_invoke gcloud "_p9k_prompt_gcloud_compute ${(q)commands[gcloud]} ${(q)P9K_GCLOUD_CONFIGURATION} ${(q)P9K_GCLOUD_ACCOUNT} ${(q)P9K_GCLOUD_PROJECT_ID}"
+  # The daemon appends the project name to the callback; the identifiers travel with it
+  # so the answer can be checked against whatever configuration is current by then.
+  _p9k_worker_invoke gcloud \
+    "_p9k_prompt_gcloud_update ${(q)P9K_GCLOUD_CONFIGURATION} ${(q)P9K_GCLOUD_ACCOUNT} ${(q)P9K_GCLOUD_PROJECT_ID}" \
+    gcloud $commands[gcloud] $P9K_GCLOUD_CONFIGURATION $P9K_GCLOUD_ACCOUNT $P9K_GCLOUD_PROJECT_ID
 }
 
 _p9k_prompt_gcloud_init() {
@@ -4762,24 +4562,7 @@ _p9k_prompt_gcloud_init() {
   typeset -g "_p9k__segment_cond_${_p9k__prompt_side}[_p9k__segment_index]"='$commands[gcloud]'
 }
 
-_p9k_prompt_gcloud_compute() {
-  local gcloud=$1
-  P9K_GCLOUD_CONFIGURATION=$2
-  P9K_GCLOUD_ACCOUNT=$3
-  P9K_GCLOUD_PROJECT_ID=$4
-  _p9k_worker_async "_p9k_prompt_gcloud_async ${(q)gcloud}" _p9k_prompt_gcloud_sync
-}
-
-_p9k_prompt_gcloud_async() {
-  local gcloud=$1
-  $gcloud projects describe $P9K_GCLOUD_PROJECT_ID --configuration=$P9K_GCLOUD_CONFIGURATION \
-    --account=$P9K_GCLOUD_ACCOUNT --format='value(name)'
-}
-
-_p9k_prompt_gcloud_sync() {
-  _p9k_worker_reply "_p9k_prompt_gcloud_update ${(q)P9K_GCLOUD_CONFIGURATION} ${(q)P9K_GCLOUD_ACCOUNT} ${(q)P9K_GCLOUD_PROJECT_ID} ${(q)REPLY%$'\n'}"
-}
-
+# $1: configuration, $2: account, $3: project id the name was fetched for, $4: project name
 _p9k_prompt_gcloud_update() {
   [[ $1 == $P9K_GCLOUD_CONFIGURATION &&
      $2 == $P9K_GCLOUD_ACCOUNT &&
@@ -5329,8 +5112,7 @@ prompt_wifi() {
 }
 
 _p9k_prompt_wifi_init() {
-  if [[ -x /System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport ||
-        -r /proc/net/wireless && -n $commands[iw] ]]; then
+  if [[ $_p9k_os == OSX || -r /proc/net/wireless && -n $commands[iw] ]]; then
     typeset -g _p9k__wifi_on=
     typeset -g P9K_WIFI_LAST_TX_RATE=
     typeset -g P9K_WIFI_SSID=
@@ -5338,77 +5120,17 @@ _p9k_prompt_wifi_init() {
     typeset -g P9K_WIFI_RSSI=
     typeset -g P9K_WIFI_NOISE=
     typeset -g P9K_WIFI_BARS=
-    _p9k__async_segments_compute+='_p9k_worker_invoke wifi _p9k_prompt_wifi_compute'
+    _p9k__async_segments_compute+='_p9k_worker_invoke wifi _p9k_prompt_wifi_sync wifi'
   else
     typeset -g "_p9k__segment_cond_${_p9k__prompt_side}[_p9k__segment_index]"='${:-}'
   fi
 }
 
-_p9k_prompt_wifi_compute() {
-  _p9k_worker_async _p9k_prompt_wifi_async _p9k_prompt_wifi_sync
-}
-
-_p9k_prompt_wifi_async() {
-  local airport=/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport
-  local last_tx_rate ssid link_auth rssi noise bars on out line v state iface
-  {
-    if [[ -x $airport ]]; then
-      out="$($airport -I)" || return 0
-      for line in ${${${(f)out}##[[:space:]]#}%%[[:space:]]#}; do
-        v=${line#*: }
-        case $line[1,-$#v-3] in
-          agrCtlRSSI)  rssi=$v;;
-          agrCtlNoise) noise=$v;;
-          state)       state=$v;;
-          lastTxRate)  last_tx_rate=$v;;
-          link\ auth)  link_auth=$v;;
-          SSID)        ssid=$v;;
-        esac
-      done
-      [[ $state == running && $rssi == (0|-<->) && $noise == (0|-<->) ]] || return 0
-    elif [[ -r /proc/net/wireless && -n $commands[iw] ]]; then
-      # Content example (https://github.com/romkatv/powerlevel10k/pull/973#issuecomment-680251804):
-      #
-      # Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE
-      #  face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22
-      # wlp3s0: 0000   58.  -52.  -256        0      0      0      0     76        0
-      local -a lines
-      lines=(${${(f)"$(</proc/net/wireless)"}:#*\|*}) || return 0
-      (( $#lines == 1 )) || return 0
-      local parts=(${=lines[1]})
-      iface=${parts[1]%:}
-      state=${parts[2]}
-      rssi=${parts[4]%.*}
-      noise=${parts[5]%.*}
-      [[ -n $iface && $state == 0## && $rssi == (0|-<->) && $noise == (0|-<->) ]] || return 0
-      # Output example (https://github.com/romkatv/powerlevel10k/pull/973#issuecomment-680251804):
-      #
-      # Connected to 74:83:c2:be:76:da (on wlp3s0)
-      # 	SSID: DailyGrindGuest1
-      # 	freq: 5745
-      # 	RX: 35192066 bytes (27041 packets)
-      # 	TX: 4090471 bytes (24287 packets)
-      # 	signal: -52 dBm
-      # 	rx bitrate: 243.0 MBit/s VHT-MCS 6 40MHz VHT-NSS 2
-      # 	tx bitrate: 240.0 MBit/s VHT-MCS 5 40MHz short GI VHT-NSS 2
-      #
-      # 	bss flags:	short-slot-time
-      # 	dtim period:	1
-      # 	beacon int:	100
-      lines=(${(f)"$(command iw dev $iface link)"}) || return 0
-      local -a match mbegin mend
-      for line in $lines; do
-        if [[ $line == (#b)[[:space:]]#SSID:[[:space:]]##(*) ]]; then
-          ssid=$match[1]
-        elif [[ $line == (#b)[[:space:]]#'tx bitrate:'[[:space:]]##([^[:space:]]##)' MBit/s'* ]]; then
-          last_tx_rate=$match[1]
-          [[ $last_tx_rate == <->.<-> ]] && last_tx_rate=${${last_tx_rate%%0#}%.}
-        fi
-      done
-      [[ -n $ssid && -n $last_tx_rate ]] || return 0
-    else
-      return 0
-    fi
+# $1: 1 when associated with a network, else empty (and so are the rest);
+# $2: ssid, $3: rssi, $4: noise, $5: transmit rate, $6: link auth
+_p9k_prompt_wifi_sync() {
+  local on=$1 ssid=$2 rssi=$3 noise=$4 last_tx_rate=$5 link_auth=$6 bars
+  if (( on )); then
     # https://www.speedguide.net/faq/how-to-read-rssisignal-and-snrnoise-ratings-440
     # http://www.wireless-nets.com/resources/tutorials/define_SNR_values.html
     local -i snr_margin='rssi - noise'
@@ -5423,48 +5145,22 @@ _p9k_prompt_wifi_async() {
     else
       bars=0
     fi
-    on=1
-  } always {
-    if (( ! on )); then
-      rssi=
-      noise=
-      ssid=
-      last_tx_rate=
-      bars=
-      link_auth=
-    fi
-    if [[ $_p9k__wifi_on         != $on           ||
-          $P9K_WIFI_LAST_TX_RATE != $last_tx_rate ||
-          $P9K_WIFI_SSID         != $ssid         ||
-          $P9K_WIFI_LINK_AUTH    != $link_auth    ||
-          $P9K_WIFI_RSSI         != $rssi         ||
-          $P9K_WIFI_NOISE        != $noise        ||
-          $P9K_WIFI_BARS         != $bars         ]]; then
-      _p9k__wifi_on=$on
-      P9K_WIFI_LAST_TX_RATE=$last_tx_rate
-      P9K_WIFI_SSID=$ssid
-      P9K_WIFI_LINK_AUTH=$link_auth
-      P9K_WIFI_RSSI=$rssi
-      P9K_WIFI_NOISE=$noise
-      P9K_WIFI_BARS=$bars
-      _p9k_print_params       \
-        _p9k__wifi_on         \
-        P9K_WIFI_LAST_TX_RATE \
-        P9K_WIFI_SSID         \
-        P9K_WIFI_LINK_AUTH    \
-        P9K_WIFI_RSSI         \
-        P9K_WIFI_NOISE        \
-        P9K_WIFI_BARS
-      echo -E - 'reset=1'
-    fi
-  }
-}
-
-_p9k_prompt_wifi_sync() {
-  if [[ -n $REPLY ]]; then
-    eval $REPLY
-    _p9k_worker_reply $REPLY
   fi
+  [[ $_p9k__wifi_on         != $on           ||
+     $P9K_WIFI_LAST_TX_RATE != $last_tx_rate ||
+     $P9K_WIFI_SSID         != $ssid         ||
+     $P9K_WIFI_LINK_AUTH    != $link_auth    ||
+     $P9K_WIFI_RSSI         != $rssi         ||
+     $P9K_WIFI_NOISE        != $noise        ||
+     $P9K_WIFI_BARS         != $bars         ]] || return
+  _p9k__wifi_on=$on
+  P9K_WIFI_LAST_TX_RATE=$last_tx_rate
+  P9K_WIFI_SSID=$ssid
+  P9K_WIFI_LINK_AUTH=$link_auth
+  P9K_WIFI_RSSI=$rssi
+  P9K_WIFI_NOISE=$noise
+  P9K_WIFI_BARS=$bars
+  reset=1
 }
 
 function _p9k_asdf_check_meta() {
@@ -5849,7 +5545,7 @@ function _p9k_prompt_net_iface_init() {
   typeset -g _p9__ip_timestamp=
   typeset -g _p9k__vpn_ip_ips=()
   [[ -z $_POWERLEVEL9K_PUBLIC_IP_VPN_INTERFACE ]] && _p9k__public_ip_not_vpn=1
-  _p9k__async_segments_compute+='_p9k_worker_invoke net_iface _p9k_prompt_net_iface_compute'
+  _p9k__async_segments_compute+='_p9k_worker_invoke net_iface _p9k_prompt_net_iface_sync net_iface'
 }
 
 # reads `iface2ip` and sets `ifaces` and `ips`
@@ -5865,33 +5561,17 @@ function _p9k_prompt_net_iface_match() {
   return $(($#ips == 0))
 }
 
-function _p9k_prompt_net_iface_compute() {
-  _p9k_worker_async _p9k_prompt_net_iface_async _p9k_prompt_net_iface_sync
-}
-
-function _p9k_prompt_net_iface_async() {
-  # netstat -inbI en0
-  local iface ip line var
+# $@: interface name, IPv4 address, received bytes, transmitted bytes, repeated once per
+# interface that is up and has an address; byte counters may be empty.
+function _p9k_prompt_net_iface_sync() {
+  local iface ip rx tx
   typeset -a iface2ip ips ifaces
-  if (( $+commands[ip] )) && [[ $+commands[ifconfig] == 0 || $OSTYPE == linux* ]]; then
-    for line in ${(f)"$(command ip -4 a show 2>/dev/null)"}; do
-      if [[ $line == (#b)<->:[[:space:]]##([^:]##):[[:space:]]##\<([^\>]#)\>* ]]; then
-        [[ ,$match[2], == *,UP,* ]] && iface=$match[1] || iface=
-      elif [[ -n $iface && $line == (#b)[[:space:]]##inet[[:space:]]##([0-9.]##)* ]]; then
-        iface2ip+=($iface $match[1])
-        iface=
-      fi
-    done
-  elif (( $+commands[ifconfig] )); then
-    for line in ${(f)"$(command ifconfig 2>/dev/null)"}; do
-      if [[ $line == (#b)([^[:space:]]##):[[:space:]]##flags=([[:xdigit:]]##)'<'* ]]; then
-        [[ $match[2] == *[13579bdfBDF] ]] && iface=$match[1] || iface=
-      elif [[ -n $iface && $line == (#b)[[:space:]]##inet[[:space:]]##([0-9.]##)* ]]; then
-        iface2ip+=($iface $match[1])
-        iface=
-      fi
-    done
-  fi
+  typeset -A iface2rx iface2tx
+  for iface ip rx tx in "$@"; do
+    iface2ip+=($iface $ip)
+    iface2rx[$iface]=$rx
+    iface2tx[$iface]=$tx
+  done
 
   if _p9k_prompt_net_iface_match $_POWERLEVEL9K_PUBLIC_IP_VPN_INTERFACE; then
     local public_ip_vpn=1
@@ -5902,31 +5582,7 @@ function _p9k_prompt_net_iface_async() {
   fi
   if _p9k_prompt_net_iface_match $_POWERLEVEL9K_IP_INTERFACE; then
     local ip_ip=$ips[1] ip_interface=$ifaces[1] ip_timestamp=$EPOCHREALTIME
-    local ip_tx_bytes ip_rx_bytes ip_tx_rate ip_rx_rate
-    if [[ $_p9k_os == (Linux|Android) ]]; then
-      if [[ -r /sys/class/net/$ifaces[1]/statistics/tx_bytes &&
-            -r /sys/class/net/$ifaces[1]/statistics/rx_bytes ]]; then
-        _p9k_read_file /sys/class/net/$ifaces[1]/statistics/tx_bytes &&
-          [[ $_p9k__ret == <-> ]] && ip_tx_bytes=$_p9k__ret &&
-        _p9k_read_file /sys/class/net/$ifaces[1]/statistics/rx_bytes &&
-          [[ $_p9k__ret == <-> ]] && ip_rx_bytes=$_p9k__ret || { ip_tx_bytes=; ip_rx_bytes=; }
-      fi
-    elif [[ $_p9k_os == (BSD|OSX) && $+commands[netstat] == 1 ]]; then
-      local -a lines
-      if lines=(${(f)"$(netstat -inbI $ifaces[1])"}); then
-        local header=($=lines[1])
-        local -i rx_idx=$header[(Ie)Ibytes]
-        local -i tx_idx=$header[(Ie)Obytes]
-        if (( rx_idx && tx_idx )); then
-          ip_tx_bytes=0
-          ip_rx_bytes=0
-          for line in ${lines:1}; do
-            (( ip_rx_bytes += ${line[(w)rx_idx]} ))
-            (( ip_tx_bytes += ${line[(w)tx_idx]} ))
-          done
-        fi
-      fi
-    fi
+    local ip_tx_bytes=$iface2tx[$ifaces[1]] ip_rx_bytes=$iface2rx[$ifaces[1]] ip_tx_rate ip_rx_rate
     if [[ -n $ip_rx_bytes ]]; then
       if [[ $ip_ip == $P9K_IP_IP && $ifaces[1] == $P9K_IP_INTERFACE ]]; then
         local -F t='ip_timestamp - _p9__ip_timestamp'
@@ -5964,12 +5620,8 @@ function _p9k_prompt_net_iface_async() {
      $P9K_IP_RX_BYTES == $ip_rx_bytes &&
      $P9K_IP_TX_RATE == $ip_tx_rate &&
      $P9K_IP_RX_RATE == $ip_rx_rate &&
-     "$_p9k__vpn_ip_ips" == "$vpn_ip_ips" ]] && return 1
-  if [[ "$_p9k__vpn_ip_ips" == "$vpn_ip_ips" ]]; then
-    echo -n 0
-  else
-    echo -n 1
-  fi
+     "$_p9k__vpn_ip_ips" == "$vpn_ip_ips" ]] && return
+  [[ "$_p9k__vpn_ip_ips" == "$vpn_ip_ips" ]] && local -i vpn_ip_changed=0 || local -i vpn_ip_changed=1
   _p9k__public_ip_vpn=$public_ip_vpn
   _p9k__public_ip_not_vpn=$public_ip_not_vpn
   P9K_IP_IP=$ip_ip
@@ -5990,28 +5642,8 @@ function _p9k_prompt_net_iface_async() {
   P9K_IP_RX_RATE=$ip_rx_rate
   _p9__ip_timestamp=$ip_timestamp
   _p9k__vpn_ip_ips=($vpn_ip_ips)
-  _p9k_print_params         \
-    _p9k__public_ip_vpn     \
-    _p9k__public_ip_not_vpn \
-    P9K_IP_IP               \
-    P9K_IP_INTERFACE        \
-    P9K_IP_TX_BYTES         \
-    P9K_IP_RX_BYTES         \
-    P9K_IP_TX_BYTES_DELTA   \
-    P9K_IP_RX_BYTES_DELTA   \
-    P9K_IP_TX_RATE          \
-    P9K_IP_RX_RATE          \
-    _p9__ip_timestamp       \
-    _p9k__vpn_ip_ips
-  echo -E - 'reset=1'
-}
-
-_p9k_prompt_net_iface_sync() {
-  local -i vpn_ip_changed=$REPLY[1]
-  REPLY[1]=""
-  eval $REPLY
-  (( vpn_ip_changed )) && REPLY+='; _p9k_vpn_ip_render'
-  _p9k_worker_reply $REPLY
+  (( vpn_ip_changed )) && _p9k_vpn_ip_render
+  reset=1
 }
 
 function _p9k_set_prompt() {
@@ -7282,11 +6914,10 @@ _p9k_init_vars() {
   typeset -gi _p9k_timewarrior_file_mtime
   typeset -g  _p9k_timewarrior_file_name
   typeset -gA _p9k__prompt_char_saved
-  typeset -g  _p9k__worker_pid
   typeset -g  _p9k__worker_req_fd
   typeset -g  _p9k__worker_resp_fd
   typeset -g  _p9k__worker_shell_pid
-  typeset -g  _p9k__worker_file_prefix
+  typeset -g  _p9k__worker_buf
   typeset -gA _p9k__worker_request_map
   typeset -ga _p9k__segment_cond_left
   typeset -ga _p9k__segment_cond_right
