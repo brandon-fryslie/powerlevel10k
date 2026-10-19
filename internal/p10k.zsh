@@ -1468,8 +1468,9 @@ _p9k_prompt_public_ip_init() {
 _p9k_prompt_public_ip_compute() {
   [[ -z $_p9k__public_ip_fetch_start ]] && (( EPOCHREALTIME >= _p9k__public_ip_next_time )) || return
   _p9k__public_ip_fetch_start=$EPOCHREALTIME
+  _p9k_worker_env
   _p9k_worker_invoke public_ip _p9k_prompt_public_ip_sync public_ip \
-    "$_POWERLEVEL9K_PUBLIC_IP_HOST" $_POWERLEVEL9K_PUBLIC_IP_METHODS
+    "$_p9k__worker_env" "$_POWERLEVEL9K_PUBLIC_IP_HOST" $_POWERLEVEL9K_PUBLIC_IP_METHODS
 }
 
 # $1: the public IP, empty when no method could find it
@@ -3074,7 +3075,8 @@ _p9k_rust_version_prefetch() {
     unset P9K_RUST_VERSION
     return
   fi
-  _p9k_worker_invoke rust_version _p9k_prompt_rust_version_sync rust_version $rustc $_p9k__cwd_a
+  _p9k_worker_env
+  _p9k_worker_invoke rust_version _p9k_prompt_rust_version_sync rust_version "$_p9k__worker_env" $rustc $_p9k__cwd_a
 }
 
 # $1: the rustc version for the directory the request was made in, empty when rustc failed
@@ -4552,9 +4554,10 @@ _p9k_gcloud_prefetch() {
   _p9k__gcloud_last_fetch_ts=EPOCHREALTIME
   # The daemon appends the project name to the callback; the identifiers travel with it
   # so the answer can be checked against whatever configuration is current by then.
+  _p9k_worker_env
   _p9k_worker_invoke gcloud \
     "_p9k_prompt_gcloud_update ${(q)P9K_GCLOUD_CONFIGURATION} ${(q)P9K_GCLOUD_ACCOUNT} ${(q)P9K_GCLOUD_PROJECT_ID}" \
-    gcloud $commands[gcloud] $P9K_GCLOUD_CONFIGURATION $P9K_GCLOUD_ACCOUNT $P9K_GCLOUD_PROJECT_ID
+    gcloud "$_p9k__worker_env" $commands[gcloud] $P9K_GCLOUD_CONFIGURATION $P9K_GCLOUD_ACCOUNT $P9K_GCLOUD_PROJECT_ID
 }
 
 _p9k_prompt_gcloud_init() {
@@ -6918,6 +6921,7 @@ _p9k_init_vars() {
   typeset -g  _p9k__worker_resp_fd
   typeset -g  _p9k__worker_shell_pid
   typeset -g  _p9k__worker_buf
+  typeset -g  _p9k__worker_env
   typeset -gA _p9k__worker_request_map
   typeset -ga _p9k__segment_cond_left
   typeset -ga _p9k__segment_cond_right
@@ -7074,7 +7078,6 @@ _p9k_init_params() {
     _POWERLEVEL9K_TERM_SHELL_INTEGRATION=1
   fi
 
-  _p9k_declare -s POWERLEVEL9K_WORKER_LOG_LEVEL
   _p9k_declare -i POWERLEVEL9K_COMMANDS_MAX_TOKEN_COUNT 64
   _p9k_declare -a POWERLEVEL9K_HOOK_WIDGETS --
   _p9k_declare -b POWERLEVEL9K_TODO_HIDE_ZERO_TOTAL 0

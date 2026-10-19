@@ -97,28 +97,44 @@ for shell in a b; do
   (( kv[ticks] >= 1 ))               && ok "$shell time ticks=$kv[ticks]" || fail "$shell time ticks: ${(q)kv[ticks]}"
 done
 
+# A directory whose name holds the wire separators is still a directory the segments
+# can ask about: the request fields travel escaped.
+local weird=$tmp/$'we\x1dird\x1e\x1f'
+mkdir -p $weird
+zpty -w a "cd ${(qqqq)weird}"
+until=$((EPOCHREALTIME + 1))
+while (( EPOCHREALTIME < until )); do read_until a 'NEVER' 0 || true; nap 5; done
+zpty -w a 'print -r -- "WEIRD fd=$_p9k__worker_resp_fd pct=$_p9k__disk_usage_pct cwd=${PWD:t} EN${:-}D"'
+read_until a 'WEIRD*END' 10 || fail "shell a printed no WEIRD line: ${(q)out}"
+line=${${(M)${(f)out}:#WEIRD *END*}[-1]}
+kv=(${(s: :)${${line#WEIRD }% END*}//=/ })
+[[ -n $kv[fd] ]]             && ok "a worker still attached in ${(q)kv[cwd]}" || fail "a worker detached after cd into ${(q)weird}"
+[[ $kv[pct] == <0-100> ]]    && ok "a disk_usage=$kv[pct] in ${(q)kv[cwd]}"  || fail "a disk_usage in weird dir: ${(q)kv[pct]}"
+
 # No helper processes: the shells have no zsh children, and one daemon serves both.
+local rtdir=($TMPDIR/p10kd-$EUID/*(/N))
+(( $#rtdir == 1 )) && ok "one runtime directory ($rtdir:t)" || fail "expected one runtime directory, found: $rtdir"
 local daemons=(${(f)"$(pgrep -f "p10kd serve $TMPDIR" || true)"})
 (( $#daemons == 1 )) && ok "one daemon ($daemons)" || fail "expected one daemon, found: $daemons"
 for shell in a b; do
   local kids=(${(f)"$(pgrep -P $pids[$shell] || true)"})
   (( $#kids == 0 )) && ok "shell $shell ($pids[$shell]) has no child processes" || fail "shell $shell has children: $kids"
 done
-[[ -S $TMPDIR/p10kd-$EUID/sock ]] && ok "socket present while shells live" || fail "socket missing"
+[[ -S $rtdir/sock ]] && ok "socket present while shells live" || fail "socket missing"
 
 # The daemon survives one shell leaving and exits after the last one.
 zpty -w a 'exit'
 zpty -d a
 nap 50
-[[ -S $TMPDIR/p10kd-$EUID/sock ]] && ok "daemon stays for shell b" || fail "daemon left early"
+[[ -S $rtdir/sock ]] && ok "daemon stays for shell b" || fail "daemon left early"
 zpty -w b 'exit'
 zpty -d b
 local -F deadline=$((EPOCHREALTIME + 3))
-while [[ -e $TMPDIR/p10kd-$EUID/sock ]] && (( EPOCHREALTIME < deadline )); do nap 5; done
-[[ ! -e $TMPDIR/p10kd-$EUID/sock ]] && ok "daemon exited with the last shell" || fail "daemon still listening"
+while [[ -e $rtdir/sock ]] && (( EPOCHREALTIME < deadline )); do nap 5; done
+[[ ! -e $rtdir/sock ]] && ok "daemon exited with the last shell" || fail "daemon still listening"
 local leftovers=(${(f)"$(pgrep -f "p10kd serve $TMPDIR" || true)"})
 (( $#leftovers == 0 )) && ok "no daemon process left" || { fail "daemon processes left: $leftovers"; kill $leftovers }
-grep -q 'last shell left' $TMPDIR/p10kd-$EUID/log && ok "log records the exit" || fail "log: $(<$TMPDIR/p10kd-$EUID/log)"
+grep -q 'last shell left' $rtdir/log && ok "log records the exit" || fail "log: $(<$rtdir/log)"
 
 rm -rf $tmp
 (( failures == 0 )) && print -r -- "e2e: all checks passed" || { print -ru2 -- "e2e: $failures check(s) failed"; exit 1 }

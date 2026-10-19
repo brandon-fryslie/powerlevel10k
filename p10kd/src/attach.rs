@@ -1,26 +1,40 @@
-//! The shell-side helper: `p10kd attach <dir> <pid>` returns 0 once `<dir>/<pid>.req`
-//! and `<dir>/<pid>.resp` exist and can be opened without blocking. It starts the daemon
-//! when none is listening, and tries once more if the daemon it reached was in the
-//! middle of shutting down (its answer is then end-of-file rather than `ok`).
+//! The shell-side helper: `p10kd attach <base> <pid>` prints the runtime directory and
+//! returns 0 once `<pid>.req` and `<pid>.resp` exist there and can be opened without
+//! blocking. It starts the daemon when none is listening, and keeps trying for a bounded
+//! time if the daemon it reached was shutting down (its answer is then end-of-file rather
+//! than `ok`) or is between losing its socket and re-binding it (serve.rs).
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::runtime::RuntimeDir;
 
+/// How long a listening daemon (`serve` reported one) may take to become connectable.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const CONNECT_RETRY: Duration = Duration::from_millis(50);
+
 pub fn attach(rt: &RuntimeDir, pid: u32) -> io::Result<()> {
-    std::fs::create_dir_all(rt.path())?;
     rt.enter()?;
-    for _ in 0..2 {
-        match try_attach(pid)? {
-            Outcome::Attached => return Ok(()),
-            Outcome::NoDaemon => spawn_serve(rt)?,
+    if try_attach(pid)? == Outcome::NoDaemon {
+        spawn_serve(rt)?;
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        while try_attach(pid)? == Outcome::NoDaemon {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("p10kd did not answer within {CONNECT_TIMEOUT:?} of being started"),
+                ));
+            }
+            std::thread::sleep(CONNECT_RETRY);
         }
     }
-    Err(io::Error::new(io::ErrorKind::ConnectionRefused, "p10kd did not answer after being started"))
+    println!("{}", rt.path().display());
+    Ok(())
 }
 
+#[derive(PartialEq)]
 enum Outcome {
     Attached,
     NoDaemon,
@@ -49,7 +63,7 @@ fn try_attach(pid: u32) -> io::Result<Outcome> {
 fn spawn_serve(rt: &RuntimeDir) -> io::Result<()> {
     let status = Command::new(std::env::current_exe()?)
         .arg("serve")
-        .arg(rt.path())
+        .arg(rt.base())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .status()?;

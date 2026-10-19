@@ -49,10 +49,10 @@ pub fn sample(segment: &Segment) -> SampleResult {
         Segment::Battery => battery::sample(),
         Segment::Wifi => wifi::sample(),
         Segment::NetIface => netiface::sample(),
-        Segment::PublicIp { host, methods } => public_ip::sample(host, methods),
-        Segment::RustVersion { rustc, cwd } => exec::rust_version(rustc, cwd),
-        Segment::Gcloud { gcloud, configuration, account, project_id } => {
-            exec::gcloud_project_name(gcloud, configuration, account, project_id)
+        Segment::PublicIp { env, host, methods } => public_ip::sample(env, host, methods),
+        Segment::RustVersion { env, rustc, cwd } => exec::rust_version(env, rustc, cwd),
+        Segment::Gcloud { env, gcloud, configuration, account, project_id } => {
+            exec::gcloud_project_name(env, gcloud, configuration, account, project_id)
         }
         Segment::Time { interval } => time::sample(*interval),
     }

@@ -3,38 +3,38 @@
 //! (`POWERLEVEL9K_PUBLIC_IP_METHODS`), tried in order and then once more over; a tool
 //! that is not installed is skipped.
 
-use std::process::Command;
+use std::ffi::OsStr;
 
-use crate::protocol::{Facts, PublicIpMethod};
+use crate::protocol::{Env, Facts, PublicIpMethod};
 
-use super::exec::first_line;
+use super::exec::{command, first_line};
 use super::SampleResult;
 
-pub fn sample(host: &str, methods: &[PublicIpMethod]) -> SampleResult {
+pub fn sample(env: &Env, host: &OsStr, methods: &[PublicIpMethod]) -> SampleResult {
     for method in methods.iter().chain(methods) {
-        if let Some(ip) = fetch(host, *method)?.filter(|ip| is_ip_shaped(ip)) {
+        if let Some(ip) = fetch(env, host, *method)?.filter(|ip| is_ip_shaped(ip)) {
             return Ok(Facts::new([ip]));
         }
     }
     Ok(Facts::new([""]))
 }
 
-fn fetch(host: &str, method: PublicIpMethod) -> Result<Option<String>, super::SampleError> {
+fn fetch(env: &Env, host: &OsStr, method: PublicIpMethod) -> Result<Option<String>, super::SampleError> {
     Ok(match method {
         PublicIpMethod::Dig => {
-            let v4 = dig("-4", "A")?.filter(|s| !s.starts_with(';'));
+            let v4 = dig(env, "-4", "A")?.filter(|s| !s.starts_with(';'));
             match v4 {
                 Some(ip) if !ip.is_empty() => Some(ip),
-                _ => dig("-6", "AAAA")?.filter(|s| !s.starts_with(';')),
+                _ => dig(env, "-6", "AAAA")?.filter(|s| !s.starts_with(';')),
             }
         }
-        PublicIpMethod::Curl => first_line(Command::new("curl").args(["--max-time", "5", "-w", "\n", host]))?,
-        PublicIpMethod::Wget => first_line(Command::new("wget").args(["-T", "5", "-qO-", host]))?,
+        PublicIpMethod::Curl => first_line(command("curl", env).args(["--max-time", "5", "-w", "\n"]).arg(host))?,
+        PublicIpMethod::Wget => first_line(command("wget", env).args(["-T", "5", "-qO-"]).arg(host))?,
     })
 }
 
-fn dig(family: &str, rrtype: &str) -> Result<Option<String>, super::SampleError> {
-    first_line(Command::new("dig").args([
+fn dig(env: &Env, family: &str, rrtype: &str) -> Result<Option<String>, super::SampleError> {
+    first_line(command("dig", env).args([
         "+tries=1",
         "+short",
         family,
@@ -64,6 +64,6 @@ mod tests {
 
     #[test]
     fn no_methods_yields_empty() {
-        assert_eq!(sample("https://example.invalid/", &[]).unwrap(), Facts::new([""]));
+        assert_eq!(sample(&Env::default(), OsStr::new("https://example.invalid/"), &[]).unwrap(), Facts::new([""]));
     }
 }

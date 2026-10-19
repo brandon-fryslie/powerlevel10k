@@ -23,7 +23,11 @@ build command to stderr when it is missing.
 
 ## Where it lives at runtime
 
-`$TMPDIR/p10kd-$EUID/` (or `/tmp/p10kd-$EUID/`):
+`$TMPDIR/p10kd-$EUID/<build id>/` (or `/tmp/p10kd-$EUID/<build id>/`). The build id is
+a hash of the sources the binary was built from, so a rebuilt p10kd gets a daemon of its
+own instead of talking to one that speaks an older protocol; `p10kd attach` prints the
+directory. Both directory levels must be real directories owned by the user with mode
+0700, which `p10kd` sets on its own directories and refuses otherwise.
 
 | file           | purpose                                              |
 |----------------|------------------------------------------------------|
@@ -34,7 +38,12 @@ build command to stderr when it is missing.
 | `run.lock`     | held by the running daemon                           |
 | `start.lock`   | held while a daemon starts or stops                  |
 
-The daemon starts on the first attach and exits when the last shell detaches.
+The daemon starts on the first attach and exits when the last shell detaches. It keeps
+its socket on disk: when a temporary-directory sweeper removes it, the daemon re-binds
+within a second.
+
+`rustc`, `gcloud`, `curl`, `wget` and `dig` run with the environment the asking shell
+sends along (`_p9k__worker_env_names` in `internal/worker.zsh`), not the daemon's own.
 
 ## Layout
 

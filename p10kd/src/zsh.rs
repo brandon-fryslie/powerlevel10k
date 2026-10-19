@@ -1,17 +1,21 @@
 //! Rendering values as zsh source text.
 //!
 //! The daemon's replies are evaluated by the shell, so every fact crosses this one
-//! boundary as a single-quoted zsh word. [LAW:single-enforcer] quoting lives here only.
+//! boundary as a single zsh word. [LAW:single-enforcer] quoting lives here only.
 
-/// Quote `s` as one zsh word that evaluates back to exactly `s`.
+use crate::protocol::RECORD_END;
+
+/// Quote `s` as one zsh word that evaluates back to exactly `s`. The word is single
+/// quoted; a single quote inside closes, escapes and reopens, and the record terminator
+/// is spliced in as `$'\x1e'` so the shell's record splitting never sees it.
 pub fn quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
+        match c {
+            '\'' => out.push_str("'\\''"),
+            c if c as u32 == RECORD_END as u32 => out.push_str("'$'\\x1e''"),
+            c => out.push(c),
         }
     }
     out.push('\'');
@@ -34,7 +38,12 @@ mod tests {
     }
 
     #[test]
+    fn record_terminator_is_spliced_as_dollar_quote() {
+        assert_eq!(quote("a\x1eb"), "'a'$'\\x1e''b'");
+    }
+
+    #[test]
     fn everything_else_is_literal() {
-        assert_eq!(quote("$HOME `x` \\ \"q\" \n"), "'$HOME `x` \\ \"q\" \n'");
+        assert_eq!(quote("$HOME `x` \\ \"q\" \n\x1f"), "'$HOME `x` \\ \"q\" \n\x1f'");
     }
 }

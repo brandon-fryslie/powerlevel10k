@@ -10,7 +10,13 @@
 //! 3. A shell attaches over the socket; the daemon creates that shell's two FIFOs and
 //!    serves it from a thread until the shell closes its request FIFO.
 //! 4. When the last shell leaves, the daemon takes `start.lock`, checks nobody attached
-//!    meanwhile, removes the socket and exits.
+//!    meanwhile, removes its socket and exits, releasing `run.lock` before `start.lock`
+//!    so a starter that was waiting never sees "running" without a listener.
+//!
+//! The socket is the daemon's to keep: temporary-directory sweepers remove entries that
+//! look idle (macOS after three days, systemd-tmpfiles after ten), so the accept loop
+//! checks once a second that its socket is still at its path and re-binds when it is
+//! gone. On exit it removes the socket only if it is still its own.
 //!
 //! Each shell's traffic rides FIFOs rather than the socket because a zsh `zsocket`
 //! descriptor is inherited by every child the shell spawns, while `sysopen -o cloexec`
@@ -18,10 +24,10 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -37,30 +43,37 @@ use crate::sample;
 /// concludes it died in between and reclaims the FIFOs.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How often the accept loop checks that its socket is still on disk.
+const SOCKET_CHECK: Duration = Duration::from_secs(1);
+
 pub fn serve(rt: &RuntimeDir) -> io::Result<()> {
-    fs::create_dir_all(rt.path())?;
-    fs::set_permissions(rt.path(), fs::Permissions::from_mode(0o700))?;
     let start = FileLock::acquire(&rt.start_lock())?;
     let Some(run) = FileLock::try_acquire(&rt.run_lock())? else {
         return Ok(());
     };
-    match fs::remove_file(rt.socket()) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
     rt.enter()?;
-    let listener = UnixListener::bind(RuntimeDir::SOCKET_NAME)?;
+    remove_if_exists(Path::new(RuntimeDir::SOCKET_NAME))?;
+    let socket = Socket::bind()?;
     let logfile = OpenOptions::new().create(true).append(true).mode(0o600).open(rt.log())?;
     detach(&logfile)?;
     drop(logfile);
     log!("started, serving {}", rt.path().display());
     drop(start);
-    accept_loop(rt, listener, run)
+    accept_loop(rt, socket, run)
+}
+
+fn remove_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Becomes a session leader with stdio pointed at /dev/null and the log; the original
-/// process exits 0 so a caller waiting on it knows the listener exists.
+/// process exits 0 so a caller waiting on it knows the listener exists. The daemon keeps
+/// the runtime directory as its cwd: the socket is a relative name there, and re-binding
+/// needs it to stay so.
 fn detach(logfile: &File) -> io::Result<()> {
     // SAFETY: no threads exist yet, so fork is safe; the parent only _exits.
     let pid = unsafe { libc::fork() };
@@ -87,44 +100,93 @@ fn detach(logfile: &File) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
-    std::env::set_current_dir("/")
+    Ok(())
 }
 
-fn accept_loop(rt: &RuntimeDir, listener: UnixListener, _run: FileLock) -> io::Result<()> {
+/// The listening socket together with the inode it was bound at, which is how the daemon
+/// tells its own socket from a successor's at the same path.
+struct Socket {
+    listener: UnixListener,
+    ino: u64,
+}
+
+impl Socket {
+    /// Binds at [`RuntimeDir::SOCKET_NAME`] in the current directory.
+    fn bind() -> io::Result<Socket> {
+        let listener = UnixListener::bind(RuntimeDir::SOCKET_NAME)?;
+        let ino = fs::symlink_metadata(RuntimeDir::SOCKET_NAME)?.ino();
+        Ok(Socket { listener, ino })
+    }
+
+    /// Whether the path still holds this socket.
+    fn on_disk(&self) -> io::Result<bool> {
+        match fs::symlink_metadata(RuntimeDir::SOCKET_NAME) {
+            Ok(meta) => Ok(meta.ino() == self.ino),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Re-binds when the path is empty. A path that holds someone else's socket (possible
+    /// only after a sweeper also removed the locks) is left to them.
+    fn rebind_if_gone(&mut self) -> io::Result<()> {
+        match fs::symlink_metadata(RuntimeDir::SOCKET_NAME) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                *self = Socket::bind()?;
+                log!("socket was removed from under us; re-bound");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn remove_if_ours(&self) -> io::Result<()> {
+        if self.on_disk()? {
+            fs::remove_file(RuntimeDir::SOCKET_NAME)?;
+        }
+        Ok(())
+    }
+}
+
+fn accept_loop(rt: &RuntimeDir, mut socket: Socket, run: FileLock) -> io::Result<()> {
     let clients = Arc::new(AtomicUsize::new(0));
     let (notify_r, notify_w) = pipe()?;
     let notify_w = Arc::new(Mutex::new(notify_w));
     loop {
         let mut fds = [
-            libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: socket.listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: notify_r.as_raw_fd(), events: libc::POLLIN, revents: 0 },
         ];
         // SAFETY: `fds` is a valid array of 2 pollfd.
-        if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+        if unsafe { libc::poll(fds.as_mut_ptr(), 2, SOCKET_CHECK.as_millis() as libc::c_int) } < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
             return Err(e);
         }
+        socket.rebind_if_gone()?;
         if fds[0].revents != 0 {
-            let (stream, _) = listener.accept()?;
+            let (stream, _) = socket.listener.accept()?;
             attach(rt, stream, &clients, &notify_w);
         }
         if fds[1].revents != 0 {
             let mut drain = [0u8; 64];
             let _ = (&notify_r).read(&mut drain);
             if clients.load(Ordering::SeqCst) == 0 {
-                let _start = FileLock::acquire(&rt.start_lock())?;
-                listener.set_nonblocking(true)?;
-                match listener.accept() {
+                let start = FileLock::acquire(&rt.start_lock())?;
+                socket.listener.set_nonblocking(true)?;
+                match socket.listener.accept() {
                     Ok((stream, _)) => {
-                        listener.set_nonblocking(false)?;
+                        socket.listener.set_nonblocking(false)?;
                         attach(rt, stream, &clients, &notify_w);
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        fs::remove_file(rt.socket())?;
+                        socket.remove_if_ours()?;
                         log!("last shell left, exiting");
+                        drop(run);
+                        drop(start);
                         return Ok(());
                     }
                     Err(e) => return Err(e),
@@ -176,6 +238,37 @@ fn attach(rt: &RuntimeDir, mut stream: UnixStream, clients: &Arc<AtomicUsize>, n
     }
 }
 
+/// One FIFO of one shell: the path it was created at and the inode it got, so that
+/// removal on drop only ever removes this FIFO and never a successor created at the
+/// same path for the same pid (a shell that re-attaches after `p10k reload`).
+struct Fifo {
+    path: PathBuf,
+    ino: u64,
+}
+
+impl Fifo {
+    fn create(path: PathBuf) -> io::Result<Fifo> {
+        remove_if_exists(&path)?;
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+        // SAFETY: `c` is a valid NUL-terminated path.
+        if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let ino = fs::symlink_metadata(&path)?.ino();
+        Ok(Fifo { path, ino })
+    }
+}
+
+impl Drop for Fifo {
+    fn drop(&mut self) {
+        if let Ok(meta) = fs::symlink_metadata(&self.path) {
+            if meta.ino() == self.ino {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
 /// The two FIFOs of one shell. `req_placeholder` is a read-write handle that exists so
 /// the shell's write-open succeeds immediately; it is dropped once the shell has said
 /// hello, so that from then on end-of-file on `req` means the shell is gone.
@@ -183,42 +276,25 @@ struct Fifos {
     req: File,
     req_placeholder: Option<File>,
     resp: Arc<Mutex<File>>,
-    req_path: std::path::PathBuf,
-    resp_path: std::path::PathBuf,
+    _req_fifo: Fifo,
+    _resp_fifo: Fifo,
 }
 
 impl Fifos {
     fn create(rt: &RuntimeDir, pid: u32) -> io::Result<Fifos> {
-        let req_path = rt.req_fifo(pid);
-        let resp_path = rt.resp_fifo(pid);
-        mkfifo(&req_path)?;
-        mkfifo(&resp_path)?;
-        let req_placeholder = OpenOptions::new().read(true).write(true).open(&req_path)?;
-        let req = OpenOptions::new().read(true).open(&req_path)?;
-        let resp = OpenOptions::new().read(true).write(true).open(&resp_path)?;
-        Ok(Fifos { req, req_placeholder: Some(req_placeholder), resp: Arc::new(Mutex::new(resp)), req_path, resp_path })
+        let req_fifo = Fifo::create(rt.req_fifo(pid))?;
+        let resp_fifo = Fifo::create(rt.resp_fifo(pid))?;
+        let req_placeholder = OpenOptions::new().read(true).write(true).open(&req_fifo.path)?;
+        let req = OpenOptions::new().read(true).open(&req_fifo.path)?;
+        let resp = OpenOptions::new().read(true).write(true).open(&resp_fifo.path)?;
+        Ok(Fifos {
+            req,
+            req_placeholder: Some(req_placeholder),
+            resp: Arc::new(Mutex::new(resp)),
+            _req_fifo: req_fifo,
+            _resp_fifo: resp_fifo,
+        })
     }
-}
-
-impl Drop for Fifos {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.req_path);
-        let _ = fs::remove_file(&self.resp_path);
-    }
-}
-
-fn mkfifo(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
-    // SAFETY: `c` is a valid NUL-terminated path.
-    if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 fn serve_client(pid: u32, mut fifos: Fifos) -> io::Result<()> {
@@ -244,20 +320,24 @@ fn serve_client(pid: u32, mut fifos: Fifos) -> io::Result<()> {
             }
             let req = match Request::parse(&record) {
                 Ok(req) => req,
-                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("bad request {record:?}: {e}"))),
+                Err(e) => {
+                    let shown = String::from_utf8_lossy(&record);
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, format!("bad request {shown:?}: {e}")));
+                }
             };
             let resp = Arc::clone(&fifos.resp);
             thread::spawn(move || {
+                let id = String::from_utf8_lossy(&req.id).into_owned();
                 let reply = match sample::sample(&req.segment) {
                     Ok(facts) => protocol::render_reply(&req, &facts),
                     Err(e) => {
-                        log!("{pid} {}: {e}", req.id);
+                        log!("{pid} {id}: {e}");
                         protocol::render_done(&req.id)
                     }
                 };
                 if let Ok(mut w) = resp.lock() {
                     if let Err(e) = w.write_all(&reply) {
-                        log!("{pid} {}: writing reply: {e}", req.id);
+                        log!("{pid} {id}: writing reply: {e}");
                     }
                 }
             });

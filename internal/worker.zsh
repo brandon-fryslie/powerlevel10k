@@ -7,9 +7,13 @@
 # queued for that segment.
 #
 # Wire format, shared with p10kd/src/protocol.rs: records end in \x1e, fields are
-# separated by \x1f.
+# separated by \x1f, and every field is escaped so any byte survives: \x1d is the
+# escape byte, with \x1dD, \x1dE, \x1dF standing for \x1d, \x1e, \x1f.
 #   request:  id \x1f callback \x1f segment \x1f arg...
 #   reply:    e<callback> 'fact' 'fact'...   then   d<id>
+#
+# Segments that run a program (rust_version, gcloud, public_ip) take the environment to
+# run it in as their first argument; _p9k_worker_env builds it.
 #
 # Traffic rides two FIFOs rather than a socket: a zsocket descriptor is inherited by
 # every child the shell spawns, while sysopen -o cloexec is not.
@@ -20,13 +24,37 @@
 # the older done, and only the newest waiting request survives.
 function _p9k_worker_invoke() {
   [[ -n $_p9k__worker_resp_fd ]] || return
-  local req=${(pj:\x1f:)@}$'\x1e'
+  local -a fields=("${(@)${(@)${(@)@//$'\x1d'/$'\x1d'D}//$'\x1e'/$'\x1d'E}//$'\x1f'/$'\x1d'F}")
+  local req=${(pj:\x1f:)fields}$'\x1e'
   if (( $+_p9k__worker_request_map[$1] == 0 )); then
     _p9k__worker_request_map[$1]=
     _p9k_worker_send $req
   else
     _p9k__worker_request_map[$1]=$req
   fi
+}
+
+# The exported variables that rustc (through rustup), gcloud, curl, wget and dig consult.
+# The daemon runs those programs with exactly this environment on the shell's behalf,
+# because its own environment belongs to whichever shell started it.
+typeset -ga _p9k__worker_env_names=(
+  HOME PATH TMPDIR LANG LC_ALL LC_CTYPE
+  RUSTUP_HOME RUSTUP_TOOLCHAIN RUSTUP_DIST_SERVER RUSTUP_UPDATE_ROOT CARGO_HOME
+  CLOUDSDK_CONFIG CLOUDSDK_PYTHON CLOUDSDK_ACTIVE_CONFIG_NAME
+  http_proxy https_proxy ftp_proxy all_proxy no_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+  CURL_HOME CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR WGETRC
+)
+
+# Sets _p9k__worker_env to the current values of $_p9k__worker_env_names that are
+# exported, as NUL-separated NAME=value entries: the env argument of a program-running
+# segment.
+function _p9k_worker_env() {
+  local n
+  local -a kv
+  for n in $_p9k__worker_env_names; do
+    [[ $parameters[$n] == *export* ]] && kv+=$n=${(P)n}
+  done
+  _p9k__worker_env=${(pj:\0:)kv}
 }
 
 function _p9k_worker_send() {
@@ -129,13 +157,15 @@ function _p9k_worker_start() {
     fi
 
     if [[ -n "$TMPDIR" && ( ( -d "$TMPDIR" && -w "$TMPDIR" ) || ! ( -d /tmp && -w /tmp ) ) ]]; then
-      local dir=$TMPDIR/p10kd-$EUID
+      local base=$TMPDIR/p10kd-$EUID
     else
-      local dir=/tmp/p10kd-$EUID
+      local base=/tmp/p10kd-$EUID
     fi
     local pid=$sysparams[pid]
 
-    command $bin attach $dir $pid || return
+    # attach prints the directory the FIFOs live in: $base/<build id of $bin>.
+    local dir
+    dir=$(command $bin attach $base $pid) || return
     # Both opens are immediate: the daemon holds the other end of each FIFO before
     # `attach` returns. Non-blocking opens turn a daemon that died in between into an
     # error instead of a hang.
