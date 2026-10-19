@@ -24,8 +24,9 @@
 # the older done, and only the newest waiting request survives.
 function _p9k_worker_invoke() {
   [[ -n $_p9k__worker_resp_fd ]] || return
-  local -a fields=("${(@)${(@)${(@)@//$'\x1d'/$'\x1d'D}//$'\x1e'/$'\x1d'E}//$'\x1f'/$'\x1d'F}")
-  local req=${(pj:\x1f:)fields}$'\x1e'
+  local e=$'\x1d' r=$'\x1e' f=$'\x1f'
+  local -a fields=("${(@)${(@)${(@)@//$e/${e}D}//$r/${e}E}//$f/${e}F}")
+  local req=${(pj:\x1f:)fields}$r
   if (( $+_p9k__worker_request_map[$1] == 0 )); then
     _p9k__worker_request_map[$1]=
     _p9k_worker_send $req

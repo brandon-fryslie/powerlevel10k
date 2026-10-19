@@ -4557,7 +4557,7 @@ _p9k_gcloud_prefetch() {
   _p9k_worker_env
   _p9k_worker_invoke gcloud \
     "_p9k_prompt_gcloud_update ${(q)P9K_GCLOUD_CONFIGURATION} ${(q)P9K_GCLOUD_ACCOUNT} ${(q)P9K_GCLOUD_PROJECT_ID}" \
-    gcloud "$_p9k__worker_env" $commands[gcloud] $P9K_GCLOUD_CONFIGURATION $P9K_GCLOUD_ACCOUNT $P9K_GCLOUD_PROJECT_ID
+    gcloud "$_p9k__worker_env" "$commands[gcloud]" $P9K_GCLOUD_CONFIGURATION $P9K_GCLOUD_ACCOUNT $P9K_GCLOUD_PROJECT_ID
 }
 
 _p9k_prompt_gcloud_init() {

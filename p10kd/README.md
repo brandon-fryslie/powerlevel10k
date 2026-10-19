@@ -15,7 +15,7 @@ the daemon because running them is the fact itself.
 
 ```sh
 make p10kd          # cargo build --release, from the repository root
-make p10kd-test     # unit + daemon tests, then an interactive end-to-end run
+make p10kd-test     # unit + daemon tests, the shell client's unit tests, then an interactive end-to-end run
 ```
 
 The theme looks for `p10kd/target/release/p10kd` under its own directory and prints the

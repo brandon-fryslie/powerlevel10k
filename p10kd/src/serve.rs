@@ -16,7 +16,8 @@
 //! The socket is the daemon's to keep: temporary-directory sweepers remove entries that
 //! look idle (macOS after three days, systemd-tmpfiles after ten), so the accept loop
 //! checks once a second that its socket is still at its path and re-binds when it is
-//! gone. On exit it removes the socket only if it is still its own.
+//! gone, retrying next tick when that fails. On exit it removes the socket only if it is
+//! still its own.
 //!
 //! Each shell's traffic rides FIFOs rather than the socket because a zsh `zsocket`
 //! descriptor is inherited by every child the shell spawns, while `sysopen -o cloexec`
@@ -166,10 +167,15 @@ fn accept_loop(rt: &RuntimeDir, mut socket: Socket, run: FileLock) -> io::Result
             }
             return Err(e);
         }
-        socket.rebind_if_gone()?;
         if fds[0].revents != 0 {
             let (stream, _) = socket.listener.accept()?;
             attach(rt, stream, &clients, &notify_w);
+        }
+        // After the accept: a rebind replaces the listener poll reported on. A failed
+        // rebind is logged and retried next tick; attached shells are served over their
+        // FIFOs and need no socket.
+        if let Err(e) = socket.rebind_if_gone() {
+            log!("re-binding the socket: {e}");
         }
         if fds[1].revents != 0 {
             let mut drain = [0u8; 64];

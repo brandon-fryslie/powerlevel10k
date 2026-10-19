@@ -20,9 +20,11 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
 fn main() {
     let mut files = vec![PathBuf::from("build.rs"), PathBuf::from("Cargo.toml"), PathBuf::from("Cargo.lock")];
     sources(Path::new("src"), &mut files);
+    for dep in ["build.rs", "Cargo.toml", "Cargo.lock", "src"] {
+        println!("cargo:rerun-if-changed={dep}");
+    }
     let mut h = std::hash::DefaultHasher::new();
     for path in &files {
-        println!("cargo:rerun-if-changed={}", path.display());
         path.hash(&mut h);
         std::fs::read(path).unwrap().hash(&mut h);
     }

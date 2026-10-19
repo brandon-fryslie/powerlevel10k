@@ -5,13 +5,15 @@
 //! than `ok`) or is between losing its socket and re-binding it (serve.rs).
 
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::runtime::RuntimeDir;
 
-/// How long a listening daemon (`serve` reported one) may take to become connectable.
+/// How long a listening daemon (`serve` reported one) may take to become connectable,
+/// and how long a connected one may take to answer.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_RETRY: Duration = Duration::from_millis(50);
 
@@ -30,8 +32,10 @@ pub fn attach(rt: &RuntimeDir, pid: u32) -> io::Result<()> {
             std::thread::sleep(CONNECT_RETRY);
         }
     }
-    println!("{}", rt.path().display());
-    Ok(())
+    let mut out = io::stdout().lock();
+    out.write_all(rt.path().as_os_str().as_bytes())?;
+    out.write_all(b"\n")?;
+    out.flush()
 }
 
 #[derive(PartialEq)]
@@ -49,9 +53,15 @@ fn try_attach(pid: u32) -> io::Result<Outcome> {
         }
         Err(e) => return Err(e),
     };
+    stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
     stream.write_all(format!("attach {pid}\n").as_bytes())?;
     let mut answer = String::new();
-    BufReader::new(&stream).read_line(&mut answer)?;
+    BufReader::new(&stream).read_line(&mut answer).map_err(|e| match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+            io::Error::new(io::ErrorKind::TimedOut, format!("p10kd is listening but did not answer within {CONNECT_TIMEOUT:?}"))
+        }
+        _ => e,
+    })?;
     match answer.trim_end() {
         "ok" => Ok(Outcome::Attached),
         "" => Ok(Outcome::NoDaemon),

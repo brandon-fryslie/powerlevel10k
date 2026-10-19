@@ -8,7 +8,7 @@ p10kd:
 
 p10kd-test:
 	cargo test --manifest-path p10kd/Cargo.toml
-	$(if $(ZSH),$(ZSH) -f p10kd/tests/e2e.zsh,$(error p10kd-test needs zsh on PATH))
+	$(if $(ZSH),$(ZSH) -f p10kd/tests/worker.zsh && $(ZSH) -f p10kd/tests/e2e.zsh,$(error p10kd-test needs zsh on PATH))
 
 .PHONY: all p10kd p10kd-test zwc minify pkg
 
