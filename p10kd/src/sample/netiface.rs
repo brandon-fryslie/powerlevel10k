@@ -16,7 +16,6 @@ use super::{SampleError, SampleResult};
 pub struct Interface {
     pub name: String,
     pub ip: Ipv4Addr,
-    pub counters: Option<Counters>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +65,7 @@ fn up_ipv4_interfaces() -> Result<Vec<Interface>, SampleError> {
         if seen.iter().any(|i: &Interface| i.name == name) {
             continue;
         }
-        seen.push(Interface { name, ip, counters: None });
+        seen.push(Interface { name, ip });
     }
     // SAFETY: `list` came from getifaddrs and is not used after this.
     unsafe { libc::freeifaddrs(list) };

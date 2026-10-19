@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use crate::lock::FileLock;
 use crate::log;
-use crate::protocol::{self, RecordBuffer, Request, HELLO};
+use crate::protocol::{self, Facts, RecordBuffer, Request, HELLO};
 use crate::runtime::RuntimeDir;
 use crate::sample;
 
@@ -347,13 +347,15 @@ fn serve_client(pid: u32, mut fifos: Fifos) -> io::Result<()> {
             let resp = Arc::clone(&fifos.resp);
             thread::spawn(move || {
                 let id = String::from_utf8_lossy(&req.id).into_owned();
-                let reply = match sample::sample(&req.segment) {
-                    Ok(facts) => protocol::render_reply(&req, &facts),
-                    Err(e) => {
-                        log!("{pid} {id}: {e}");
-                        protocol::render_done(&req.id)
-                    }
-                };
+                // [LAW:dataflow-not-control-flow] the callback runs once per request whatever
+                // the sampler did: a failure is logged here and reaches the shell as a reply
+                // with no facts, so the segment's own state machine (public_ip's in-flight
+                // mark, time's next tick) keeps turning instead of waiting forever.
+                let facts = sample::sample(&req.segment).unwrap_or_else(|e| {
+                    log!("{pid} {id}: {e}");
+                    Facts::default()
+                });
+                let reply = protocol::render_reply(&req, &facts);
                 if let Ok(mut w) = resp.lock() {
                     if let Err(e) = w.write_all(&reply) {
                         log!("{pid} {id}: writing reply: {e}");

@@ -122,10 +122,17 @@ fn attach_request_reply_detach_exit() {
     assert!(pct <= 100);
     assert_eq!(shell.recv(Duration::from_secs(2)), "ddisk_usage");
 
-    // A sampler that fails still finishes the request, so the shell's queue never sticks.
+    // A program that is missing is a fact (an empty one), not a failure.
     shell.request(&[s("gcloud"), s("_p9k_prompt_gcloud_update 'c' 'a' 'p'"), s("gcloud"), s(""), s("/no/such/gcloud"), s("c"), s("a"), s("p")]);
     assert_eq!(shell.recv(Duration::from_secs(2)), "e_p9k_prompt_gcloud_update 'c' 'a' 'p' ''");
     assert_eq!(shell.recv(Duration::from_secs(2)), "dgcloud");
+
+    // A sampler that fails (statvfs ENOTDIR here) still runs the callback, with no
+    // facts, and still finishes the request: the segment can re-arm and the queue moves.
+    shell.request(&[s("disk_usage"), s("_p9k_prompt_disk_usage_sync"), s("disk_usage"), s("/etc/passwd/not-a-dir")]);
+    assert_eq!(shell.recv(Duration::from_secs(2)), "e_p9k_prompt_disk_usage_sync");
+    assert_eq!(shell.recv(Duration::from_secs(2)), "ddisk_usage");
+    assert!(shell.log().contains("statvfs /etc/passwd/not-a-dir"), "{}", shell.log());
 
     // The time tick arrives at the next interval boundary.
     let t0 = Instant::now();

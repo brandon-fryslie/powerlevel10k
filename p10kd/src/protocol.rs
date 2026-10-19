@@ -8,6 +8,10 @@
 //! Request:  `id \x1f callback \x1f segment \x1f arg…`
 //! Reply:    `e<callback> 'fact' 'fact'…`  then  `d<id>`
 //!
+//! Every request gets both records, a failed sample included: its reply carries no
+//! facts, and the daemon logs why. The callback is the segment's one chance to advance
+//! its own state, so it is never skipped.
+//!
 //! Segments that run a program take the environment to run it in as their first
 //! argument: `NAME=value` entries separated by NUL, empty for no environment.
 //!
@@ -246,8 +250,8 @@ pub fn render_reply(req: &Request, facts: &Facts) -> Vec<u8> {
     out
 }
 
-/// `d<id>\x1e` alone: the request finished without a fact to deliver.
-pub fn render_done(id: &[u8]) -> Vec<u8> {
+/// `d<id>\x1e`: the request is finished and the next one queued for `id` may go.
+fn render_done(id: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(id.len() + 2);
     out.push(b'd');
     out.extend_from_slice(id);

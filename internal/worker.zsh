@@ -11,6 +11,8 @@
 # escape byte, with \x1dD, \x1dE, \x1dF standing for \x1d, \x1e, \x1f.
 #   request:  id \x1f callback \x1f segment \x1f arg...
 #   reply:    e<callback> 'fact' 'fact'...   then   d<id>
+# A sample the daemon could not take answers the same way with no facts (the daemon
+# logs why), so every callback runs exactly once per request.
 #
 # Segments that run a program (rust_version, gcloud, public_ip) take the environment to
 # run it in as their first argument; _p9k_worker_env builds it.
