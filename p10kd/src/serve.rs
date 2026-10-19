@@ -16,8 +16,8 @@
 //! The socket is the daemon's to keep: temporary-directory sweepers remove entries that
 //! look idle (macOS after three days, systemd-tmpfiles after ten), so the accept loop
 //! checks once a second that its socket is still at its path and re-binds when it is
-//! gone, retrying next tick when that fails. On exit it removes the socket only if it is
-//! still its own.
+//! gone. When even that fails (the directory itself was swept) it serves the shells it
+//! has and accepts no more. On exit it removes the socket only if it is still its own.
 //!
 //! Each shell's traffic rides FIFOs rather than the socket because a zsh `zsocket`
 //! descriptor is inherited by every child the shell spawns, while `sysopen -o cloexec`
@@ -46,6 +46,9 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the accept loop checks that its socket is still on disk.
 const SOCKET_CHECK: Duration = Duration::from_secs(1);
+
+/// How long a peer that connected to the socket has to send its attach line.
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub fn serve(rt: &RuntimeDir) -> io::Result<()> {
     let start = FileLock::acquire(&rt.start_lock())?;
@@ -105,10 +108,13 @@ fn detach(logfile: &File) -> io::Result<()> {
 }
 
 /// The listening socket together with the inode it was bound at, which is how the daemon
-/// tells its own socket from a successor's at the same path.
+/// tells its own socket from a successor's at the same path. Once a re-bind has failed
+/// the path is `abandoned`: the directory itself is gone, every later attempt would fail
+/// the same way, and the daemon serves the shells it has until they leave.
 struct Socket {
     listener: UnixListener,
     ino: u64,
+    abandoned: bool,
 }
 
 impl Socket {
@@ -116,7 +122,7 @@ impl Socket {
     fn bind() -> io::Result<Socket> {
         let listener = UnixListener::bind(RuntimeDir::SOCKET_NAME)?;
         let ino = fs::symlink_metadata(RuntimeDir::SOCKET_NAME)?.ino();
-        Ok(Socket { listener, ino })
+        Ok(Socket { listener, ino, abandoned: false })
     }
 
     /// Whether the path still holds this socket.
@@ -129,16 +135,25 @@ impl Socket {
     }
 
     /// Re-binds when the path is empty. A path that holds someone else's socket (possible
-    /// only after a sweeper also removed the locks) is left to them.
-    fn rebind_if_gone(&mut self) -> io::Result<()> {
-        match fs::symlink_metadata(RuntimeDir::SOCKET_NAME) {
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                *self = Socket::bind()?;
+    /// only after a sweeper also removed the locks) is left to them. A re-bind that fails
+    /// is logged once and not retried.
+    fn rebind_if_gone(&mut self) {
+        if self.abandoned {
+            return;
+        }
+        let gone = matches!(fs::symlink_metadata(RuntimeDir::SOCKET_NAME), Err(e) if e.kind() == io::ErrorKind::NotFound);
+        if !gone {
+            return;
+        }
+        match Socket::bind() {
+            Ok(socket) => {
+                *self = socket;
                 log!("socket was removed from under us; re-bound");
-                Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                self.abandoned = true;
+                log!("socket was removed from under us and cannot be re-bound ({e}); serving attached shells only");
+            }
         }
     }
 
@@ -171,12 +186,8 @@ fn accept_loop(rt: &RuntimeDir, mut socket: Socket, run: FileLock) -> io::Result
             let (stream, _) = socket.listener.accept()?;
             attach(rt, stream, &clients, &notify_w);
         }
-        // After the accept: a rebind replaces the listener poll reported on. A failed
-        // rebind is logged and retried next tick; attached shells are served over their
-        // FIFOs and need no socket.
-        if let Err(e) = socket.rebind_if_gone() {
-            log!("re-binding the socket: {e}");
-        }
+        // After the accept: a rebind replaces the listener poll reported on.
+        socket.rebind_if_gone();
         if fds[1].revents != 0 {
             let mut drain = [0u8; 64];
             let _ = (&notify_r).read(&mut drain);
@@ -206,7 +217,9 @@ fn accept_loop(rt: &RuntimeDir, mut socket: Socket, run: FileLock) -> io::Result
 /// makes them openable without blocking, and only then answers `ok`.
 fn attach(rt: &RuntimeDir, mut stream: UnixStream, clients: &Arc<AtomicUsize>, notify: &Arc<Mutex<File>>) {
     let mut line = String::new();
-    if let Err(e) = BufReader::new(&stream).read_line(&mut line) {
+    // A peer that connects and says nothing must not hold the accept loop.
+    let read = stream.set_read_timeout(Some(ATTACH_TIMEOUT)).and_then(|()| BufReader::new(&stream).read_line(&mut line));
+    if let Err(e) = read {
         log!("attach: reading request: {e}");
         return;
     }

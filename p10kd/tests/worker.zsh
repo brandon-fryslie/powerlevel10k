@@ -20,14 +20,19 @@ function _p9k_worker_send() { sent=$1 }
 # stays a field.
 _p9k_worker_invoke disk_usage cb disk_usage "a"$'\x1d'"b"$'\x1e'"c"$'\x1f'"d" ""
 local want=$'disk_usage\x1fcb\x1fdisk_usage\x1fa\x1dDb\x1dEc\x1dFd\x1f\x1e'
-[[ $sent == $want ]] && ok "invoke escapes fields: ${(q)sent}" || fail "invoke sent ${(q)sent}, want ${(q)want}"
+[[ $sent == "$want" ]] && ok "invoke escapes fields: ${(q)sent}" || fail "invoke sent ${(q)sent}, want ${(q)want}"
 
-# A second request for an id in flight waits, and only the newest waiting one survives.
+# The first request for an id is sent; while it is in flight a second one waits, and
+# only the newest waiting one survives.
+_p9k__worker_request_map=()
 sent=
 _p9k_worker_invoke disk_usage cb disk_usage /one
+[[ $sent == $'disk_usage\x1fcb\x1fdisk_usage\x1f/one\x1e' ]] && ok "first request for an id is sent" || fail "first request: ${(q)sent}"
+sent=
 _p9k_worker_invoke disk_usage cb disk_usage /two
-[[ -z $sent ]] && ok "request for a busy id is queued, not sent" || fail "sent while busy: ${(q)sent}"
-[[ $_p9k__worker_request_map[disk_usage] == $'disk_usage\x1fcb\x1fdisk_usage\x1f/two\x1e' ]] \
+_p9k_worker_invoke disk_usage cb disk_usage /three
+[[ -z $sent ]] && ok "requests for a busy id are queued, not sent" || fail "sent while busy: ${(q)sent}"
+[[ $_p9k__worker_request_map[disk_usage] == $'disk_usage\x1fcb\x1fdisk_usage\x1f/three\x1e' ]] \
   && ok "newest queued request survives" || fail "queued: ${(q)_p9k__worker_request_map[disk_usage]}"
 
 # The env holds exported names from the list, as NAME=value joined by NUL, nothing else.
@@ -36,7 +41,7 @@ typeset -g P10KD_T_LOCAL=no
 _p9k__worker_env_names=(P10KD_T_EXPORTED P10KD_T_LOCAL P10KD_T_UNSET HOME)
 _p9k_worker_env
 want=$'P10KD_T_EXPORTED=yes\0'"HOME=$HOME"
-[[ $_p9k__worker_env == $want ]] && ok "env is the exported names only: ${(q)_p9k__worker_env}" \
+[[ $_p9k__worker_env == "$want" ]] && ok "env is the exported names only: ${(q)_p9k__worker_env}" \
   || fail "env is ${(q)_p9k__worker_env}, want ${(q)want}"
 _p9k__worker_env_names=(P10KD_T_UNSET)
 _p9k_worker_env

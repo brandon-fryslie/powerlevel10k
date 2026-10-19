@@ -17,11 +17,19 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Everything that shapes the binary: hashed into its id, and what makes this script re-run.
+const ROOTS: [&str; 4] = ["build.rs", "Cargo.toml", "Cargo.lock", "src"];
+
 fn main() {
-    let mut files = vec![PathBuf::from("build.rs"), PathBuf::from("Cargo.toml"), PathBuf::from("Cargo.lock")];
-    sources(Path::new("src"), &mut files);
-    for dep in ["build.rs", "Cargo.toml", "Cargo.lock", "src"] {
-        println!("cargo:rerun-if-changed={dep}");
+    let mut files = Vec::new();
+    for root in ROOTS {
+        println!("cargo:rerun-if-changed={root}");
+        let path = PathBuf::from(root);
+        if path.is_dir() {
+            sources(&path, &mut files);
+        } else {
+            files.push(path);
+        }
     }
     let mut h = std::hash::DefaultHasher::new();
     for path in &files {

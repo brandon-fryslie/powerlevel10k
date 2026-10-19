@@ -98,19 +98,27 @@ for shell in a b; do
 done
 
 # A directory whose name holds the wire separators is still a directory the segments
-# can ask about: the request fields travel escaped, so the daemon keeps the session.
-# (p10kd/tests/worker.zsh asserts the bytes; here only the session's survival is
-# observable, since every directory under $tmp reports the same disk usage.)
+# can ask about: the request fields travel escaped. Every prompt asks disk_usage about
+# the cwd and the sync callback ignores an empty answer, so once the cd has settled the
+# value is cleared: only an answer about the weird directory itself, which does not
+# exist under any other name, can make it numeric again.
 local weird=$tmp/$'we\x1dird\x1e\x1f'
 mkdir -p $weird
 zpty -w a "cd ${(qqqq)weird}"
 until=$((EPOCHREALTIME + 1))
 while (( EPOCHREALTIME < until )); do read_until a 'NEVER' 0 || true; nap 5; done
-zpty -w a 'print -r -- "WEIRD fd=${_p9k__worker_resp_fd:-none} cwd=${PWD:t} EN${:-}D"'
-read_until a 'WEIRD*END' 10 || fail "shell a printed no WEIRD line: ${(q)out}"
-line=${${(M)${(f)out}:#WEIRD *END*}[-1]}
-kv=(${(s: :)${${line#WEIRD }% END*}//=/ })
-[[ $kv[fd] != none ]] && ok "a worker still attached in ${(q)kv[cwd]}" || fail "a worker detached after cd into ${(q)weird}"
+zpty -w a '_p9k__disk_usage_pct='
+until=$((EPOCHREALTIME + 3))
+while (( EPOCHREALTIME < until )); do
+  zpty -w a 'print -r -- "WEIRD fd=${_p9k__worker_resp_fd:-none} pct=${_p9k__disk_usage_pct:-none} cwd=${PWD:t} EN${:-}D"'
+  read_until a 'WEIRD*END' 10 || { fail "shell a printed no WEIRD line: ${(q)out}"; break }
+  line=${${(M)${(f)out}:#WEIRD *END*}[-1]}
+  kv=(${(s: :)${${line#WEIRD }% END*}//=/ })
+  [[ $kv[pct] != none || $kv[fd] == none ]] && break
+  nap 5
+done
+[[ $kv[fd] != none ]]     && ok "a worker still attached in ${(q)kv[cwd]}" || fail "a worker detached after cd into ${(q)weird}"
+[[ $kv[pct] == <0-100> ]] && ok "a disk_usage=$kv[pct] sampled in ${(q)kv[cwd]}" || fail "a disk_usage in ${(q)weird}: $kv[pct]"
 
 # No helper processes: the shells have no zsh children, and one daemon serves both.
 local rtdir=($TMPDIR/p10kd-$EUID/*(/N))
